@@ -12,23 +12,48 @@ import json
 import tracemalloc
 import pandas as pd
 import encodings.idna
+from hashlib import md5
+import cProfile
+import pstats
+from lxml import etree, cssselect, html
 
 
-class Parser:
+# class Parser:
 
-    def __init__(self, text):
-        self.soup = BeautifulSoup(text, 'html.parser')
+#     def __init__(self, text):
+#         self.soup = BeautifulSoup(text, 'html.parser')
+
+#     def parse(self):
+#         elements = self.soup.select(
+#             'a[href]:not(a[rel="nofollow"],[href^="javascript:"])')
+#         urls = [element.get('href') for element in elements]
+#         elements = self.soup.select('[src]:not(form)')
+#         urls.extend(element.get('src') for element in elements)
+#         return urls
+
+#     def get_canonical_link(self):
+#         element = self.soup.find('link', {'rel': 'canonical'})
+#         if element is None:
+#             return False
+#         return element.get('href')
+class Parser():
+    def __init__(self, html_string) -> None:
+        self.dochtml = html.fromstring(html_string)
 
     def parse(self):
-        elements = self.soup.select(
+        # select = cssselect.CSSSelector(
+        # 'a:not(a[rel="nofollow"])')
+
+        select = cssselect.CSSSelector(
             'a[href]:not(a[rel="nofollow"],[href^="javascript:"])')
-        urls = [element.get('href') for element in elements]
-        elements = self.soup.select('[src]:not(form)')
-        urls.extend(element.get('src') for element in elements)
+        urls = [el.get('href') for el in select(self.dochtml)]
+        select = cssselect.CSSSelector('[src]:not(form)')
+        urls.extend(el.get('src') for el in select(self.dochtml))
         return urls
 
     def get_canonical_link(self):
-        element = self.soup.find('link', {'rel': 'canonical'})
+        element = cssselect.CSSSelector(
+            'link[rel="canonical"]')
         if element is None:
             return False
         return element.get('href')
@@ -38,7 +63,7 @@ class UrlParser:
     """
     A class for parsing URLs into their component parts.
     """
-    @staticmethod
+    @ staticmethod
     def get_root_url(url):
         """
         Given a URL, returns the root URL by extracting the scheme and netloc.
@@ -48,7 +73,7 @@ class UrlParser:
         """
         return urlparse(url).scheme + '://' + urlparse(url).netloc
 
-    @staticmethod
+    @ staticmethod
     def encode_url_once(url):
         """
         Encodes the given URL only once, if it is not already encoded.
@@ -64,7 +89,7 @@ class UrlParser:
             return url
         return UrlParser().encode_url(url)
 
-    @staticmethod
+    @ staticmethod
     def encode_url(url):
         """
         Encodes a given URL by replacing non-ASCII characters in the domain component
@@ -92,7 +117,7 @@ class UrlParser:
             domain, encoded_domain).replace(path, encoded_path)
         return encoded_url
 
-    @staticmethod
+    @ staticmethod
     def decode_url(url):
         """
         Decodes a given URL by replacing Punycode-encoded domain and URL-encoded path components.
@@ -119,7 +144,7 @@ class UrlParser:
             domain, decoded_domain).replace(path, decoded_path)
         return decoded_url
 
-    @staticmethod
+    @ staticmethod
     def is_url_already_encoded(url):
         """
         Check if the given URL is already URL encoded.
@@ -251,13 +276,13 @@ class Crawler:
             url, frag = urldefrag(url)
             self.links.append([parenturl, url])
             if (parenturl.startswith(self.rooturl) and
-                    not any(exclude_part in url for exclude_part in self.exclude_urls) and
-                    url not in self.busy and
-                    url not in self.done.url_encode and
-                    url not in self.todo_queue and
-                    (len(self.done) + len(self.busy) + len(self.todo_queue)
-                     < self.limit or not self.limit)
-                    or force
+                        not any(exclude_part in url for exclude_part in self.exclude_urls) and
+                        url not in self.busy and
+                        url not in self.done.url_encode and
+                        url not in self.todo_queue and
+                        (len(self.done) + len(self.busy) + len(self.todo_queue)
+                         < self.limit or not self.limit)
+                        or force
                     ):
                 if self.check_allow_crawl(url):
                     self.todo_queue.add(url)
@@ -287,8 +312,10 @@ class Crawler:
 
         # remove url from basic queue and add it into busy list
         self.busy.add(url)
-        self.todo_queue.remove(url)
-
+        try:
+            self.todo_queue.remove(url)
+        except Exception:
+            pass
         try:
             # await response
             start = time.time()
@@ -309,8 +336,11 @@ class Crawler:
                 self.errors.add(url)
                 asyncio.Task(self.addurls([('', url)], True))
             else:
+                error = repr(str(exc))
+                if error == '':
+                    error = 'Unknown'
                 self.append_done(
-                    url=url, indexability_status=repr(str(exc)))
+                    url=url, indexability_status=error)
         else:
             # only url with status == 200 and content type == 'text/html' parsed
             if (resp.status == 200 and
@@ -320,7 +350,7 @@ class Crawler:
                 urls = parser.parse()
                 asyncio.Task(self.addurls([(u, url) for u in urls]))
                 self.append_done(resp, new_url, indexability=True,
-                                 hash_val=hash(data), response_time=stop-start)
+                                 hash_val=md5(data.encode()).hexdigest(), response_time=stop-start)
             else:
                 self.append_done(resp, new_url, indexability=True,
                                  response_time=stop-start)
@@ -364,9 +394,12 @@ def check_duplicate(text1, text2):
     return similarity[0][0]
 
 
+profiler = cProfile.Profile()
+profiler.enable()
+
 tracemalloc.start()
 c = Crawler('https://www.thailandpostmart.com/',
-            limit=3, http_request_options={"timeout": 10}, maxtasks=10)
+            limit=10, http_request_options={"timeout": 10}, maxtasks=100)
 
 # cProfile.run("c.runsync()")
 c.runsync()
@@ -378,6 +411,9 @@ print(f"Memory usage: {mem[0] / 10**6} MB")
 print(f"Memory peak: {mem[1] / 10**6} MB")
 # stopping the library
 tracemalloc.stop()
+profiler.disable()
+stats = pstats.Stats(profiler).sort_stats('cumtime')
+stats.print_stats('run_sync')
 # start = time.time()
 # a = check_duplicate('https://www.thailandpostmart.com/product/1013460000224/',
 #                     'https://www.thailandpostmart.com/product/1013460000224/')
