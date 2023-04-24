@@ -1,2 +1,4 @@
 .vscode/
 .devcontainer/
+/test.py
+/export.xlsx
