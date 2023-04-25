@@ -41,14 +41,15 @@ class Parser():
         self.dochtml = html.fromstring(html_string)
 
     def parse(self):
-        # select = cssselect.CSSSelector(
-        # 'a:not(a[rel="nofollow"])')
-
         select = cssselect.CSSSelector(
-            'a[href]:not(a[rel="nofollow"],[href^="javascript:"])')
+            'a:not(a[rel="nofollow"])')
+        # select = cssselect.CSSSelector(
+        #     'a[href]:not(a[rel="nofollow"],[href^="javascript:"])')
         urls = [el.get('href') for el in select(self.dochtml)]
         select = cssselect.CSSSelector('[src]:not(form)')
         urls.extend(el.get('src') for el in select(self.dochtml))
+        urls = list(
+            filter(lambda x: x and not x.startswith('javascript:'), urls))
         return urls
 
     def get_canonical_link(self):
@@ -85,9 +86,11 @@ class UrlParser:
             str: The encoded URL.
 
         """
-        if UrlParser().is_url_already_encoded(url):
+        parser = UrlParser()
+        is_encoded = parser.is_url_already_encoded(url)
+        if is_encoded:
             return url
-        return UrlParser().encode_url(url)
+        return parser.encode_url(url)
 
     @ staticmethod
     def encode_url(url):
@@ -128,6 +131,8 @@ class UrlParser:
         Returns:
             str: The decoded URL.
         """
+        if '%' not in url:
+            return url
         url_components = urlparse(url)
         domain = url_components.netloc
         path = url_components.path
@@ -186,7 +191,7 @@ class Crawler:
         :param maxtasks: maximum count of tasks. Default 100
         :type maxtasks: int
         """
-        self.url = UrlParser.encode_url_once(url)
+        self.url = UrlParser.decode_url(url)
         self.rooturl = f'{urlparse(url).scheme}://{urlparse(url).netloc}'
         self.todo_queue = todo_queue_backend()
         self.busy = set()
@@ -216,12 +221,27 @@ class Crawler:
         :return: `RobotFileParser` object that was created after parsing
                 `robots.txt` file.
         """
+        # rp = urllib.robotparser.RobotFileParser()
+        # response = requests.get(
+        #     urljoin(UrlParser.get_root_url(url), 'robots.txt'))
+        # url = urljoin(UrlParser.get_root_url(response.url), 'robots.txt')
+        # start = time.time()
+        # rp.set_url(url)
+        # print(f'Parsing {url}: {time.time()-start}')
+        # start = time.time()
+        # request = requests.get(url)
+        # print(f'Parsing {url}: {time.time()-start}')
+        # start = time.time()
+        # rp.read()
+        # print(f'Parsing {url}: {time.time()-start}')
         rp = urllib.robotparser.RobotFileParser()
         response = requests.get(
-            urljoin(UrlParser.get_root_url(url), 'robots.txt'))
+            urljoin(UrlParser.get_root_url(url), 'robots.txt'), timeout=1)
         url = urljoin(UrlParser.get_root_url(response.url), 'robots.txt')
         rp.set_url(url)
-        rp.read()
+        response = requests.get(rp.url)
+        robot_txt = response.text
+        rp.parse(robot_txt.splitlines())
         return rp
 
     def set_parser(self, parser_class):
@@ -245,6 +265,8 @@ class Crawler:
         await t
         await self.session.close()
         self.done.to_excel('export.xlsx', index=False)
+        df = pd.DataFrame(self.links, columns=['from', 'to'])
+        df.to_excel('links.xlsx', index=False)
         # json_object = json.dumps(self.done, indent=4, ensure_ascii=False)
         # with open('json.json', 'w') as f:
         #     f.write(json_object)
@@ -255,6 +277,7 @@ class Crawler:
         # await self.writer.write([key for key, value in self.done.items() if value])
 
     def check_allow_crawl(self, url):
+        return True
         try:
             if self.rp.get(UrlParser().get_root_url(url)) is None:
                 self.rp[UrlParser().get_root_url(url)] = self.robots_txt(url)
@@ -270,20 +293,21 @@ class Crawler:
         :return:
         """
         for url, parenturl in urls:
-            url = UrlParser.encode_url_once(url)
-            parenturl = UrlParser.encode_url_once(parenturl)
-            url = urllib.parse.urljoin(parenturl, url)
+            url = UrlParser.decode_url(url)
+            parenturl = UrlParser.decode_url(parenturl)
+            if not url.startswith('http'):
+                url = urllib.parse.urljoin(parenturl, url)
             url, frag = urldefrag(url)
             self.links.append([parenturl, url])
             if (parenturl.startswith(self.rooturl) and
-                        not any(exclude_part in url for exclude_part in self.exclude_urls) and
-                        url not in self.busy and
-                        url not in self.done.url_encode and
-                        url not in self.todo_queue and
-                        (len(self.done) + len(self.busy) + len(self.todo_queue)
+                not any(exclude_part in url for exclude_part in self.exclude_urls) and
+                url not in self.busy and
+                url not in self.done.url_encode and
+                url not in self.todo_queue and
+                (len(self.done) + len(self.busy) + len(self.todo_queue)
                          < self.limit or not self.limit)
-                        or force
-                    ):
+                or force
+                ):
                 if self.check_allow_crawl(url):
                     self.todo_queue.add(url)
                     # Acquire semaphore
@@ -334,21 +358,23 @@ class Crawler:
             print('...', url, 'has error', repr(str(exc)))
             if url not in self.errors:
                 self.errors.add(url)
-                asyncio.Task(self.addurls([('', url)], True))
+                addurls = self.addurls([('', url)], True)
+                asyncio.Task(addurls)
             else:
                 error = repr(str(exc))
-                if error == '':
-                    error = 'Unknown'
+                if len(error) <= 1:
+                    error = 'Timeout'
                 self.append_done(
                     url=url, indexability_status=error)
         else:
             # only url with status == 200 and content type == 'text/html' parsed
             if (resp.status == 200 and
-                    ('text/html' in resp.headers.get('content-type'))):
+                    ('text/html' in resp.headers.get('content-type')) and str(resp.url).startswith(self.rooturl)):
                 data = (await resp.read()).decode('utf-8', 'replace')
                 parser = Parser(data)
                 urls = parser.parse()
-                asyncio.Task(self.addurls([(u, url) for u in urls]))
+                addurls = self.addurls([(u, url) for u in urls])
+                asyncio.Task(addurls)
                 self.append_done(resp, new_url, indexability=True,
                                  hash_val=md5(data.encode()).hexdigest(), response_time=stop-start)
             else:
@@ -364,9 +390,12 @@ class Crawler:
                      'still pending, todo_queue', len(self.todo_queue))
 
     def append_done(self, response=None, url='', indexability=False, indexability_status=None, hash_val=None, response_time=None):
+        url_encode = UrlParser.encode_url_once(url)
+        if len(url_encode) > 2000:
+            url_encode = None
         self.done = pd.concat([self.done, pd.DataFrame({
             "url": UrlParser.decode_url(url),
-            "url_encode": UrlParser.encode_url_once(url),
+            "url_encode": url_encode,
             "indexability": indexability,
             "indexability_status": indexability_status,
             "content_type": response.headers.get('content-type') if response else None,
@@ -399,7 +428,7 @@ profiler.enable()
 
 tracemalloc.start()
 c = Crawler('https://www.thailandpostmart.com/',
-            limit=10, http_request_options={"timeout": 10}, maxtasks=100)
+            limit=9999, http_request_options={"timeout": 60}, maxtasks=100)
 
 # cProfile.run("c.runsync()")
 c.runsync()
@@ -412,8 +441,10 @@ print(f"Memory peak: {mem[1] / 10**6} MB")
 # stopping the library
 tracemalloc.stop()
 profiler.disable()
-stats = pstats.Stats(profiler).sort_stats('cumtime')
-stats.print_stats('run_sync')
+stats = pstats.Stats(profiler)
+# stats = pstats.Stats(profiler).sort_stats('cumtime')
+# stats.print_stats()
+stats.dump_stats("results.prof")
 # start = time.time()
 # a = check_duplicate('https://www.thailandpostmart.com/product/1013460000224/',
 #                     'https://www.thailandpostmart.com/product/1013460000224/')
