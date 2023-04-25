@@ -4,7 +4,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import time
 import asyncio
 import aiohttp
-from urllib.parse import urljoin, urldefrag, urlparse, unquote, quote
+from urllib.parse import urljoin, urldefrag, urlparse, unquote, quote, urlsplit
 import urllib.robotparser
 from bs4 import BeautifulSoup
 import logging
@@ -16,7 +16,7 @@ from hashlib import md5
 import cProfile
 import pstats
 from lxml import etree, cssselect, html
-
+from protego import Protego
 
 # class Parser:
 
@@ -36,6 +36,8 @@ from lxml import etree, cssselect, html
 #         if element is None:
 #             return False
 #         return element.get('href')
+
+
 class Parser():
     def __init__(self, html_string) -> None:
         self.dochtml = html.fromstring(html_string)
@@ -72,7 +74,7 @@ class UrlParser:
         :param url: A string representing the URL to extract the root from.
         :return: A string representing the root URL.
         """
-        return urlparse(url).scheme + '://' + urlparse(url).netloc
+        return urlsplit(url).scheme + '://' + urlsplit(url).netloc
 
     @ staticmethod
     def encode_url_once(url):
@@ -105,7 +107,7 @@ class UrlParser:
         Returns:
             str: The encoded URL.
         """
-        url_components = urlparse(url)
+        url_components = urlsplit(url)
         domain = url_components.netloc
         path = url_components.path
 
@@ -133,7 +135,7 @@ class UrlParser:
         """
         if '%' not in url:
             return url
-        url_components = urlparse(url)
+        url_components = urlsplit(url)
         domain = url_components.netloc
         path = url_components.path
 
@@ -192,7 +194,7 @@ class Crawler:
         :type maxtasks: int
         """
         self.url = UrlParser.decode_url(url)
-        self.rooturl = f'{urlparse(url).scheme}://{urlparse(url).netloc}'
+        self.rooturl = f'{urlsplit(url).scheme}://{urlsplit(url).netloc}'
         self.todo_queue = todo_queue_backend()
         self.busy = set()
         self.done = pd.DataFrame(columns=['url',
@@ -264,9 +266,9 @@ class Crawler:
             await asyncio.sleep(1)
         await t
         await self.session.close()
-        self.done.to_excel('export.xlsx', index=False)
+        self.done.to_csv('export.csv', index=False)
         df = pd.DataFrame(self.links, columns=['from', 'to'])
-        df.to_excel('links.xlsx', index=False)
+        df.to_csv('links.csv', index=False)
         # json_object = json.dumps(self.done, indent=4, ensure_ascii=False)
         # with open('json.json', 'w') as f:
         #     f.write(json_object)
@@ -277,10 +279,13 @@ class Crawler:
         # await self.writer.write([key for key, value in self.done.items() if value])
 
     def check_allow_crawl(self, url):
-        return True
         try:
-            if self.rp.get(UrlParser().get_root_url(url)) is None:
-                self.rp[UrlParser().get_root_url(url)] = self.robots_txt(url)
+            root_url = UrlParser.get_root_url(url)
+            if self.rp.get(root_url) is None:
+                request = requests.get(
+                    f'{root_url}/robots.txt', timeout=1, allow_redirects=False)
+                rp = Protego.parse(request.text)
+                self.rp[root_url] = rp
             rp = self.rp.get(UrlParser().get_root_url(url))
             return rp.can_fetch('*', url)
         except Exception:
@@ -295,18 +300,18 @@ class Crawler:
         for url, parenturl in urls:
             url = UrlParser.decode_url(url)
             parenturl = UrlParser.decode_url(parenturl)
-            if not url.startswith('http'):
+            if not (url.startswith('https://') or url.startswith('http://')):
                 url = urllib.parse.urljoin(parenturl, url)
             url, frag = urldefrag(url)
             self.links.append([parenturl, url])
             if (parenturl.startswith(self.rooturl) and
-                not any(exclude_part in url for exclude_part in self.exclude_urls) and
-                url not in self.busy and
-                url not in self.done.url_encode and
-                url not in self.todo_queue and
-                (len(self.done) + len(self.busy) + len(self.todo_queue)
-                         < self.limit or not self.limit)
-                or force
+                    not any(exclude_part in url for exclude_part in self.exclude_urls) and
+                    url not in self.busy and
+                    url not in self.done.url_encode and
+                    url not in self.todo_queue and
+                    (len(self.done) + len(self.busy) + len(self.todo_queue)
+                     < self.limit or not self.limit)
+                    or force
                 ):
                 if self.check_allow_crawl(url):
                     self.todo_queue.add(url)
@@ -391,8 +396,8 @@ class Crawler:
 
     def append_done(self, response=None, url='', indexability=False, indexability_status=None, hash_val=None, response_time=None):
         url_encode = UrlParser.encode_url_once(url)
-        if len(url_encode) > 2000:
-            url_encode = None
+        # if len(url_encode) > 2000:
+        #     url_encode = None
         self.done = pd.concat([self.done, pd.DataFrame({
             "url": UrlParser.decode_url(url),
             "url_encode": url_encode,
@@ -403,6 +408,7 @@ class Crawler:
             "hash": hash_val,
             "response_time": response_time
         }, index=[0])])
+        self.done.append
 
     def set_exclude_url(self, urls_list):
         self.exclude_urls = urls_list
@@ -428,7 +434,7 @@ profiler.enable()
 
 tracemalloc.start()
 c = Crawler('https://www.thailandpostmart.com/',
-            limit=9999, http_request_options={"timeout": 60}, maxtasks=100)
+            limit=1000, http_request_options={"timeout": 60, "allow_redirects": False}, maxtasks=100)
 
 # cProfile.run("c.runsync()")
 c.runsync()
