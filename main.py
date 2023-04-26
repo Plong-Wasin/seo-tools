@@ -34,6 +34,13 @@ class Parser():
         return urls
 
     def get_canonical_link(self):
+        """Find the canonical link element on the page and return its href attribute.
+
+        Returns:
+            The href attribute of the first 'link' element with a 'canonical' 'rel'
+            attribute on the page, or False if there is no such element.
+
+        """
         element = cssselect.CSSSelector(
             'link[rel="canonical"]')
         if element is None:
@@ -41,6 +48,12 @@ class Parser():
         return element.get('href')
 
     def is_follow(self):
+        """
+        Check if the page should be followed by search engine bots.
+
+        :return: True if the page should be followed, False if it should not.
+        :rtype: bool
+        """
         select = cssselect.CSSSelector(
             'meta[name="robots"][content*="nofollow"]')
         element = select(self.dochtml)
@@ -49,6 +62,17 @@ class Parser():
         return True
 
     def is_index(self):
+        """Check if the page should be indexed by search engines.
+
+        This function looks for a <meta> tag with the attribute name="robots"
+        and content containing the string "noindex". If such a tag is found
+        in the document represented by the `dochtml` instance variable, this
+        function returns False, indicating that the page should not be indexed.
+        Otherwise, it returns True.
+
+        Returns:
+            bool: True if the page should be indexed, False otherwise.
+        """
         select = cssselect.CSSSelector(
             'meta[name="robots"][content*="noindex"]')
         element = select(self.dochtml)
@@ -191,7 +215,7 @@ class Crawler:
         self.url = UrlParser.decode_url(url)
         self.rooturl = f'{urlsplit(url).scheme}://{urlsplit(url).netloc}'
         self.todo_queue = todo_queue_backend()
-        self.busy = set()
+        self.busy = dict()
         self.done = pd.DataFrame(columns=['url',
                                           'indexability',
                                           'indexability_status',
@@ -227,10 +251,20 @@ class Crawler:
         """
         t = asyncio.ensure_future(self.addurls([(self.url, self.rooturl)]))
         await asyncio.sleep(1)
-        while self.busy:
+        busy = dict()
+        count = 0
+        while self.busy and count < 300:
             await asyncio.sleep(1)
+            if self.busy == busy:
+                count += 1
+            else:
+                count = 0
+                busy = self.busy.copy()
         await t
         await self.session.close()
+        for k, v in self.busy.items():
+            self.append_done(url=k, indexability=False,
+                             indexability_status="Always busy")
         self.done.to_csv('export.csv', index=False)
         self.done.reset_index().to_feather('export.ftr')
         df = pd.DataFrame(self.links, columns=['from', 'to'])
@@ -336,7 +370,10 @@ class Crawler:
         print('remaining: ', len(self.todo_queue))
         print('processing:', unquote(url))
         # remove url from basic queue and add it into busy list
-        self.busy.add(url)
+        if url in self.busy:
+            self.busy[url] += 1
+        else:
+            self.busy[url] = 1
         if url in self.todo_queue:
             self.todo_queue.remove(url)
         try:
@@ -347,8 +384,7 @@ class Crawler:
         except asyncio.exceptions.TimeoutError as exc:
             if url not in self.errors:
                 self.errors.add(url)
-                addurls = self.addurls([('', url)], True)
-                asyncio.Task(addurls)
+                self.enqueue_url(url)
             else:
                 self.append_done(
                     url=url, indexability_status=type(exc).__name__)
@@ -369,7 +405,7 @@ class Crawler:
                 data = (await resp.read()).decode('utf-8', 'replace')
                 parser = Parser(data)
                 urls = parser.parse()
-                if parser.is_follow:
+                if parser.is_follow():
                     addurls = self.addurls([(u, url) for u in urls])
                     asyncio.Task(addurls)
                 indexability_status = None
@@ -390,8 +426,7 @@ class Crawler:
                                  indexability_status=resp.reason,
                                  response_time=stop-start)
                 if redirect_url:
-                    addurls = self.addurls([(redirect_url, url)])
-                    asyncio.Task(addurls)
+                    self.add_redirect_url(url, redirect_url)
             elif resp.status > 400:
                 self.append_done(response=resp,
                                  url=url,
@@ -406,14 +441,28 @@ class Crawler:
 
             # even if we have no exception, we can mark url as good
             resp.close()
-
-        if url in self.busy:
-            self.busy.remove(url)
-        else:
+        try:
+            self.busy[url] -= 1
+            if not self.busy[url]:
+                del self.busy[url]
+        except Exception as exc:
             print(url)
-            print(self.busy)
         logging.info(len(self.done), 'completed tasks,', len(self.tasks),
                      'still pending, todo_queue', len(self.todo_queue))
+
+    def add_redirect_url(self, url, redirect_url):
+        addurls = self.addurls([(redirect_url, url)])
+        asyncio.Task(addurls)
+
+    def enqueue_url(self, url):
+        """
+        Adds a URL to the list of URLs to be processed.
+
+        Args:
+            url (str): The URL to be added.
+        """
+        addurls = self.addurls([('', url)], True)
+        asyncio.Task(addurls)
 
     def append_done(self,
                     response=None,
@@ -454,8 +503,8 @@ profiler = cProfile.Profile()
 profiler.enable()
 
 tracemalloc.start()
-c = Crawler('https://www.thailandpostmart.com/',
-            limit=9999, http_request_options={"timeout": 60}, maxtasks=100)
+c = Crawler('https://teroasia.com/',
+            limit=100, http_request_options={"timeout": 60}, maxtasks=100)
 try:
     with open('robots.txt.json', 'r', encoding="utf-8") as f:
         c.robots_txt = json.load(f)
