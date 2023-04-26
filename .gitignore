@@ -2,3 +2,7 @@
 .devcontainer/
 /test.py
 /export.xlsx
+/*
+!/main.py
+!/requirements.txt
+!/.gitignore
