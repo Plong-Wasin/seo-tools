@@ -74,21 +74,17 @@ class Parser():
         return True
 
     def is_index(self):
-        """Check if the page should be indexed by search engines.
-
+        """
         This function looks for a < meta > tag with the attribute name = "robots"
         and content containing the string "noindex". If such a tag is found
         in the document represented by the `dochtml` instance variable, this
         function returns False, indicating that the page should not be indexed.
         Otherwise, it returns True.
-
-        Returns:
-            bool: True if the page should be indexed, False otherwise.
         """
-        select = cssselect.CSSSelector(
+        selector = cssselect.CSSSelector(
             'meta[name="robots"][content*="noindex"]')
-        element = select(self.dochtml)
-        if element:
+        elements = selector(self.dochtml)
+        if elements:
             return False
         return True
 
@@ -268,12 +264,6 @@ class Crawler:
         self.busy_timeout = busy_timeout
         self.allow_external = allow_external
 
-    def is_done(self, url):
-        for d in self.done.values():
-            if (url == d['url'] or url == d['url_decode']):
-                return True
-        return False
-
     async def run(self):
         """
         Main function to start parsing site
@@ -309,19 +299,22 @@ class Crawler:
         try:
             root_url = UrlParser.get_root_url(url)
             if self.robots_txt.get(root_url) is None:
-                response = await self.session.get(
-                    f'{root_url}/robots.txt', timeout=1, allow_redirects=False)
-                if not response.ok:
-                    self.robots_txt[root_url] = True
-                    return True
-                self.robots_txt[root_url] = await response.text()
-                rp = Protego.parse(self.robots_txt[root_url])
+                self.robots_txt[root_url] = await self._get_robots_txt(root_url)
             elif self.robots_txt[root_url] is True:
                 return True
             rp = Protego.parse(self.robots_txt[root_url])
             return rp.can_fetch('*', url)
-        except asyncio.exceptions.TimeoutError:
+        except (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientConnectorError):
             return True
+
+    async def _get_robots_txt(self, url):
+        response = await self.session.get(
+            f'{url}/robots.txt', timeout=1, allow_redirects=False)
+        if not response.ok:
+            self.robots_txt[url] = True
+            return True
+        self.robots_txt[url] = await response.text()
+        return self.robots_txt[url]
 
     async def addurls(self, urls, force=False):
         """
@@ -336,19 +329,7 @@ class Crawler:
                 url = urljoin(parenturl, url)
             url, frag = urldefrag(url)
             self.links.append([parenturl, url])
-            if (
-                (
-                    parenturl.startswith(self.rooturl) and self.allow_external or
-                    url.startswith(self.rooturl)
-                ) and
-                not any(exclude_part in url for exclude_part in self.exclude_urls) and
-                url not in self.busy and
-                url not in self.check_done and
-                url not in self.todo_queue and
-                (len(self.check_done) + len(self.busy) + len(self.todo_queue)
-                 <= self.limit or not self.limit)
-                or force
-            ):
+            if self.should_crowl(force, url, parenturl):
                 if await self.check_allow_crawl(url):
                     self.todo_queue.add(url)
                     # Acquire semaphore
@@ -365,6 +346,21 @@ class Crawler:
                 else:
                     self.append_done(
                         url=url, indexability_status="Block by robots.txt")
+
+    def should_crowl(self, force, url, parenturl):
+        return (
+            (
+                parenturl.startswith(self.rooturl) and self.allow_external or
+                url.startswith(self.rooturl)
+            ) and
+            not any(exclude_part in url for exclude_part in self.exclude_urls) and
+            url not in self.busy and
+            url not in self.check_done and
+            url not in self.todo_queue and
+            (len(self.check_done) + len(self.busy) + len(self.todo_queue)
+             <= self.limit or not self.limit)
+            or force
+        )
 
     async def process(self, url):
         """
@@ -394,7 +390,7 @@ class Crawler:
                 self.append_done(
                     url=url, indexability_status=type(exc).__name__)
             # get response url
-        except Exception as exc:
+        except aiohttp.client_exceptions.ClientConnectorError as exc:
             print(exc)
             # on any exception mark url as BAD
             print('...', url, 'has error', repr(str(exc)))
@@ -480,19 +476,17 @@ class Crawler:
         """
         Appends information about the given URL to the 'done' list of this object.
         """
-        url_decoded = UrlParser.decode_url(url)
-        canonical_url = dom.get_canonical_url() if dom else None
-        self.check_done.add(url_decoded)
+        self.check_done.add(UrlParser.decode_url(url))
         meta = dom.get_meta() if dom else {}
         self.done.append({
-            "url": url_decoded,
+            "url": UrlParser.decode_url(url),
             "indexability": indexability,
             "indexability_status": indexability_status,
             "content_type": response.headers.get('content-type') if response else None,
             "response_code": response.status if response else None,
             "hash": hash_val,
             "redirected_url": response.headers.get('location') if response else None,
-            "canonical_url": canonical_url,
+            "canonical_url": dom.get_canonical_url() if dom else None,
             **meta
         })
 
