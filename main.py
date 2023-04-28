@@ -1,18 +1,16 @@
-import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 import asyncio
 import aiohttp
 from urllib.parse import urljoin, urldefrag, unquote, quote, urlsplit
-import urllib.robotparser
 import logging
 import tracemalloc
 import pandas as pd
 from hashlib import md5
 import cProfile
 import pstats
-from lxml import etree, cssselect, html
+from lxml import cssselect, html
 from protego import Protego
 import json
 
@@ -39,8 +37,6 @@ class Parser():
         """
         select = cssselect.CSSSelector(
             'a:not(a[rel="nofollow"]),link[ref="canonical"]')
-        # select = cssselect.CSSSelector(
-        #     'a[href]:not(a[rel="nofollow"],[href^="javascript:"])')
         urls = [el.get('href') for el in select(self.dochtml)]
         select = cssselect.CSSSelector('[src]:not(form)')
         urls.extend(el.get('src') for el in select(self.dochtml))
@@ -95,6 +91,25 @@ class Parser():
         if element:
             return False
         return True
+
+    def get_meta(self):
+        """
+        Extracts meta tags from self.dochtml and returns a dictionary.
+        """
+        select = cssselect.CSSSelector(
+            'meta[name="robots"][content],title,meta[name="description"][content],meta[property^="og:"][content]')
+        elements = select(self.dochtml)
+        return_value = {}
+        for element in elements:
+            if element.tag == 'title':
+                return_value['title'] = element.text
+            else:
+                key = element.get("property") or element.get("name")
+                value = element.get("content")
+                if value.startswith('http'):
+                    value = UrlParser.decode_url(value)
+                return_value[key] = value
+        return return_value
 
 
 class UrlParser:
@@ -186,7 +201,7 @@ class UrlParser:
             decoded_url = url.replace(
                 domain, decoded_domain).replace(path, decoded_path)
             return decoded_url
-        except UnicodeDecodeError as err:
+        except UnicodeDecodeError:
             return url
 
     @ staticmethod
@@ -207,33 +222,31 @@ class UrlParser:
 
 
 class Crawler:
-    # format_processors = {
-    #     'xml': XMLWriter,
-    #     'txt': TextWriter
-    # }
-
     robots_txt = {}
     exclude_urls = []
+    session = None
 
     def __init__(
-        self, url: str, out_file: str = 'sitemap.xml', out_format: str = 'xml',
-        maxtasks: int = 10, todo_queue_backend=set, done_backend=dict,
-        http_request_options=None, limit=0, busy_timeout=300, allow_external=True
+        self, url: str,
+        maxtasks: int = 10,
+        http_request_options: dict = None,
+        limit: int = 0,
+        busy_timeout: int = 300,
+        allow_external: bool = True
     ):
         """
-        Crawler constructor
-        : param rooturl: root url of site
-        : type rooturl: str
-        : param out_file: file to save sitemap result
-        : type out_file: str
-        : param out_format: sitemap type[xml | txt]. Default xml
-        : type out_format: str
-        : param maxtasks: maximum count of tasks. Default 100
-        : type maxtasks: int
+        Initializes a web crawler instance.
+        Args:
+            url (str): The starting URL for the crawler.
+            maxtasks (int, optional): The maximum number of tasks to run in parallel.
+            http_request_options (dict, optional): Additional options to pass to the HTTP request.
+            limit (int, optional): The maximum number of pages to crawl.
+            busy_timeout (int, optional): The maximum time a task can be busy before being cancelled.
+            allow_external (bool, optional): Whether or not to follow external links.
         """
         self.url = url
         self.rooturl = f'{urlsplit(url).scheme}://{urlsplit(url).netloc}'
-        self.todo_queue = todo_queue_backend()
+        self.todo_queue = set()
         self.busy = dict()
         self.done = pd.DataFrame(columns=['url',
                                           'indexability',
@@ -242,6 +255,7 @@ class Crawler:
                                           'content_type',
                                           'response_time',
                                           'hash'])
+        self.done = list()
         self.tasks = set()
         self.sem = asyncio.Semaphore(maxtasks)
         self.http_request_options = http_request_options or {}
@@ -249,15 +263,10 @@ class Crawler:
         self.links = list()
         self.errors = set()
         # connector stores cookies between requests and uses connection pool
-        self.session = aiohttp.ClientSession()
         self.limit = limit
         self.check_done = set()
         self.busy_timeout = busy_timeout
         self.allow_external = allow_external
-        # self.writer = self.format_processors.get(out_format)(out_file)
-
-    def set_parser(self, parser_class):
-        self.parser = parser_class
 
     def is_done(self, url):
         for d in self.done.values():
@@ -270,6 +279,7 @@ class Crawler:
         Main function to start parsing site
         : return:
         """
+        self.session = aiohttp.ClientSession()
         t = asyncio.ensure_future(self.addurls([(self.url, self.rooturl)]))
         await asyncio.sleep(1)
         busy = dict()
@@ -286,12 +296,12 @@ class Crawler:
         for k, v in self.busy.items():
             self.append_done(url=k, indexability=False,
                              indexability_status="Always busy")
+        self.done = pd.DataFrame(self.done)
         self.done.to_csv('export.csv', index=False)
-        self.done.reset_index().to_feather('export.ftr')
         df = pd.DataFrame(self.links, columns=['from', 'to']).drop_duplicates()
         df.to_csv('links.csv', index=False)
 
-    def check_allow_crawl(self, url):
+    async def check_allow_crawl(self, url):
         """
         Check if crawling the given URL is allowed, according to the robots.txt file of the site it belongs to.
         Returns True if crawling is allowed, False otherwise.
@@ -299,45 +309,19 @@ class Crawler:
         try:
             root_url = UrlParser.get_root_url(url)
             if self.robots_txt.get(root_url) is None:
-                response = requests.get(
+                response = await self.session.get(
                     f'{root_url}/robots.txt', timeout=1, allow_redirects=False)
                 if not response.ok:
                     self.robots_txt[root_url] = True
                     return True
-                self.robots_txt[root_url] = response.text
-                rp = Protego.parse(response.text)
+                self.robots_txt[root_url] = await response.text()
+                rp = Protego.parse(self.robots_txt[root_url])
             elif self.robots_txt[root_url] is True:
                 return True
             rp = Protego.parse(self.robots_txt[root_url])
             return rp.can_fetch('*', url)
-        except Exception:
+        except asyncio.exceptions.TimeoutError:
             return True
-
-    # async def check_allow_crawl(self, url):
-    #     """
-    #     Check if crawling the given URL is allowed, according to the robots.txt file of the site it belongs to.
-    #     Returns True if crawling is allowed, False otherwise.
-    #     """
-    #     try:
-    #         root_url = UrlParser.get_root_url(url)
-    #         if self.rp.get(root_url) is None:
-    #             response = await self.session.get(
-    #                 f'{root_url}/robots.txt', timeout=1, allow_redirects=False)
-    #             if not response.ok:
-    #                 self.rp[root_url] = True
-    #                 return True
-    #             rp = Protego.parse(response.text)
-    #             self.rp[root_url] = rp
-    #         elif self.rp[root_url] is True:
-    #             return True
-    #         rp = self.rp.get(UrlParser().get_root_url(url))
-    #         return rp.can_fetch('*', url)
-    #     except Exception as exc:
-    #         print(exc)
-    #         return True
-
-    # def check_allow_crawl_sync(self, url):
-    #     return asyncio.Task(self.check_allow_crawl(url))
 
     async def addurls(self, urls, force=False):
         """
@@ -365,7 +349,7 @@ class Crawler:
                  <= self.limit or not self.limit)
                 or force
             ):
-                if self.check_allow_crawl(url):
+                if await self.check_allow_crawl(url):
                     self.todo_queue.add(url)
                     # Acquire semaphore
                     await self.sem.acquire()
@@ -479,6 +463,9 @@ class Crawler:
                      'still pending, todo_queue', len(self.todo_queue))
 
     def add_url(self, url, parent_url=''):
+        """
+        Adds a URL to the crawler's queue for later processing.
+        """
         addurls = self.addurls([(url, parent_url)])
         asyncio.Task(addurls)
 
@@ -491,13 +478,13 @@ class Crawler:
                     response_time: float = None,
                     dom=None):
         """
-        Append a row to the `done` dataframe with information about a URL that has been processed.
+        Appends information about the given URL to the 'done' list of this object.
         """
         url_decoded = UrlParser.decode_url(url)
         canonical_url = dom.get_canonical_url() if dom else None
-        canonical_url = canonical_url if canonical_url != url_decoded else None
         self.check_done.add(url_decoded)
-        self.done = pd.concat([self.done, pd.DataFrame({
+        meta = dom.get_meta() if dom else {}
+        self.done.append({
             "url": url_decoded,
             "indexability": indexability,
             "indexability_status": indexability_status,
@@ -505,10 +492,14 @@ class Crawler:
             "response_code": response.status if response else None,
             "hash": hash_val,
             "redirected_url": response.headers.get('location') if response else None,
-            "canonical_url": canonical_url
-        }, index=[0])])
+            "canonical_url": canonical_url,
+            **meta
+        })
 
     def set_exclude_url(self, urls_list):
+        """
+        Set the list of URLs to exclude from crawling.
+        """
         self.exclude_urls = urls_list
 
     def runsync(self):
@@ -524,8 +515,8 @@ profiler.enable()
 
 tracemalloc.start()
 c = Crawler('https://www.thailandpostmart.com/',
-            limit=1000, http_request_options={"timeout": 60}, maxtasks=100,
-            allow_external=False
+            limit=100, http_request_options={"timeout": 60}, maxtasks=100,
+            allow_external=True
             )
 c.set_exclude_url(['/app/tag/name', '/search/allproducts/',
                   ".pdf", ".jpg", ".zip", 'mod_resize.index', '.png'])

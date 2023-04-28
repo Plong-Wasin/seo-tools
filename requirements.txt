@@ -1,5 +1,4 @@
-aiohttp
+aiohttp[speedups]
 aiofiles
 asyncio
-beautifulsoup4
 pandas
