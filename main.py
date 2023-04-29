@@ -58,7 +58,7 @@ class Parser():
         element = select(self.dochtml)
         if not element:
             return None
-        return UrlParser.decode_url(element[0].get('href'))
+        return element[0].get('href')
 
     def is_follow(self):
         """
@@ -245,7 +245,7 @@ class Crawler:
             busy_timeout (int, optional): The maximum time a task can be busy before being cancelled.
             allow_external (bool, optional): Whether or not to follow external links.
         """
-        self.url = url
+        self.url = UrlParser.encode_url_once(url)
         self.rooturl = f'{urlsplit(url).scheme}://{urlsplit(url).netloc}'
         self.todo_queue = set()
         self.busy = dict()
@@ -334,8 +334,6 @@ class Crawler:
         :return:
         """
         for url, parenturl in urls:
-            url = UrlParser.decode_url(url)
-            parenturl = UrlParser.decode_url(parenturl)
             if not (url.startswith('https://') or url.startswith('http://')):
                 url = urljoin(parenturl, url)
             url, frag = urldefrag(url)
@@ -500,8 +498,9 @@ class Crawler:
         """
         Appends information about the given URL to the 'done' list of this object.
         """
-        self.check_done.add(UrlParser.decode_url(url))
+        self.check_done.add(url)
         meta = dom.get_meta() if dom else {}
+        canonical_url = dom.get_canonical_url() if dom else None
         self.done.append({
             "url": UrlParser.decode_url(url),
             "indexability": indexability,
@@ -509,8 +508,8 @@ class Crawler:
             "content_type": response.headers.get('content-type') if response else None,
             "response_code": response.status if response else None,
             "hash": hash_val,
-            "redirected_url": response.headers.get('location') if response else None,
-            "canonical_url": dom.get_canonical_url() if dom else None,
+            "redirected_url": UrlParser.decode_url(response.headers.get('location')) if response and response.headers.get('location') else None,
+            "canonical_url": UrlParser.decode_url(canonical_url) if canonical_url else None,
             **meta
         })
 
