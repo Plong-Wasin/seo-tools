@@ -392,7 +392,10 @@ class Crawler:
 
     def _has_excluded_part(self, url):
         """Checks if a given url contains any part that should be excluded"""
-        return any(exclude_part in url for exclude_part in self.exclude_urls)
+        for exclude_part in self.exclude_urls:
+            if exclude_part in url:
+                return True
+        return False
 
     async def process(self, url):
         """
@@ -532,8 +535,8 @@ profiler.enable()
 
 tracemalloc.start()
 c = Crawler('https://www.thailandpostmart.com/',
-            limit=100, http_request_options={"timeout": 60}, maxtasks=100,
-            allow_external=True
+            limit=0, http_request_options={"timeout": 60}, maxtasks=100,
+            allow_external=True, busy_timeout=60
             )
 c.set_exclude_url(['/app/tag/name', '/search/allproducts/',
                   ".pdf", ".jpg", ".zip", 'mod_resize.index', '.png'])
