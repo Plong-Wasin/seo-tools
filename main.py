@@ -13,6 +13,7 @@ import pstats
 from lxml import cssselect, html
 from protego import Protego
 import json
+from icecream import ic
 
 
 class Parser():
@@ -219,8 +220,12 @@ class UrlParser:
 
 class Crawler:
     robots_txt = {}
+    rp = {}
     exclude_urls = []
     session = None
+    done_df = pd.DataFrame()
+    links_df = pd.DataFrame()
+    robots_txt_busy = set()
 
     def __init__(
         self, url: str,
@@ -249,7 +254,6 @@ class Crawler:
                                           'indexability_status',
                                           'response_code',
                                           'content_type',
-                                          'response_time',
                                           'hash'])
         self.done = list()
         self.tasks = set()
@@ -286,35 +290,42 @@ class Crawler:
         for k, v in self.busy.items():
             self.append_done(url=k, indexability=False,
                              indexability_status="Always busy")
-        self.done = pd.DataFrame(self.done)
-        self.done.to_csv('export.csv', index=False)
-        df = pd.DataFrame(self.links, columns=['from', 'to']).drop_duplicates()
-        df.to_csv('links.csv', index=False)
+        self.done_df = pd.DataFrame(self.done)
+
+        self.links_df = pd.DataFrame(
+            self.links, columns=['from', 'to']).drop_duplicates()
 
     async def check_allow_crawl(self, url):
         """
         Check if crawling the given URL is allowed, according to the robots.txt file of the site it belongs to.
-        Returns True if crawling is allowed, False otherwise.
         """
-        try:
-            root_url = UrlParser.get_root_url(url)
+        root_url = UrlParser.get_root_url(url)
+        while root_url in self.robots_txt_busy:
+            await asyncio.sleep(1)
+        if not self.rp.get(root_url):
             if self.robots_txt.get(root_url) is None:
-                self.robots_txt[root_url] = await self._get_robots_txt(root_url)
-            elif self.robots_txt[root_url] is True:
+                self.robots_txt_busy.add(root_url)
+                response_text = await self._get_robots_txt(root_url)
+                self.robots_txt_busy.remove(root_url)
+                if not response_text:
+                    self.robots_txt[root_url] = True
+                    return True
+                self.robots_txt[root_url] = response_text
+            if self.robots_txt[root_url] is True:
                 return True
-            rp = Protego.parse(self.robots_txt[root_url])
-            return rp.can_fetch('*', url)
-        except (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientConnectorError):
-            return True
+            self.rp[root_url] = Protego.parse(
+                self.robots_txt[root_url])
+        return self.rp[root_url].can_fetch('*', url)
 
     async def _get_robots_txt(self, url):
-        response = await self.session.get(
-            f'{url}/robots.txt', timeout=1, allow_redirects=False)
+        try:
+            response = await self.session.get(
+                f'{url}/robots.txt', timeout=5, allow_redirects=False)
+        except (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientConnectorError):
+            return False
         if not response.ok:
-            self.robots_txt[url] = True
-            return True
-        self.robots_txt[url] = await response.text()
-        return self.robots_txt[url]
+            return False
+        return await response.text()
 
     async def addurls(self, urls, force=False):
         """
@@ -348,56 +359,60 @@ class Crawler:
                         url=url, indexability_status="Block by robots.txt")
 
     def should_crowl(self, force, url, parenturl):
-        return (
-            (
-                parenturl.startswith(self.rooturl) and self.allow_external or
-                url.startswith(self.rooturl)
-            ) and
-            not any(exclude_part in url for exclude_part in self.exclude_urls) and
-            url not in self.busy and
-            url not in self.check_done and
-            url not in self.todo_queue and
-            (len(self.check_done) + len(self.busy) + len(self.todo_queue)
-             <= self.limit or not self.limit)
-            or force
-        )
+        """
+        Determines whether a URL should be crawled, based on various criteria.
+        """
+        # If we're forcing the crawl, then we should crawl the URL.
+        if force:
+            return True
+        # If we're out of available slots, then don't crawl.
+        if not self._has_available_slots():
+            return False
+        # If the URL isn't available, then don't crawl.
+        if not self._is_url_available(url):
+            return False
+        # If the URL isn't in the domain, then don't crawl.
+        if not self._is_url_in_domain(url, parenturl):
+            return False
+        # If the URL contains an excluded part, then don't crawl.
+        if self._has_excluded_part(url):
+            return False
+        # If we've made it this far, then we should crawl the URL.
+        return True
+
+    def _is_url_available(self, url):
+        """Checks if a given url is available, i.e. not in any of the queues"""
+        return url not in self.busy and url not in self.check_done and url not in self.todo_queue
+
+    def _has_available_slots(self):
+        """Checks if there are available slots for urls to be checked"""
+        return len(self.check_done) + len(self.busy) + len(self.todo_queue) < self.limit or not self.limit
+
+    def _is_url_in_domain(self, url, parenturl):
+        """Checks if a given url is in the same domain as the parenturl"""
+        return parenturl.startswith(self.rooturl) or url.startswith(self.rooturl)
+
+    def _has_excluded_part(self, url):
+        """Checks if a given url contains any part that should be excluded"""
+        return any(exclude_part in url for exclude_part in self.exclude_urls)
 
     async def process(self, url):
         """
         Process single url
-        :param url:
-        :return:
         """
-        print('remaining: ', len(self.todo_queue))
-        print('processing:', unquote(url))
+        # print('remaining: ', len(self.todo_queue))
+        # print('processing:', unquote(url))
         # remove url from basic queue and add it into busy list
-        if url in self.busy:
-            self.busy[url] += 1
-        else:
-            self.busy[url] = 1
+        self.busy[url] = self.busy.get(url, 0) + 1
         if url in self.todo_queue:
             self.todo_queue.remove(url)
         try:
             # await response
-            start = time.time()
             resp = await self.session.get(url, **self.http_request_options)
-            stop = time.time()
         except asyncio.exceptions.TimeoutError as exc:
-            if url not in self.errors:
-                self.errors.add(url)
-                self.add_url(url)
-            else:
-                self.append_done(
-                    url=url, indexability_status=type(exc).__name__)
-            # get response url
+            self._on_timeout_error(url, exc)
         except aiohttp.client_exceptions.ClientConnectorError as exc:
-            print(exc)
-            # on any exception mark url as BAD
-            print('...', url, 'has error', repr(str(exc)))
-            error_msg = repr(str(exc)) if repr(
-                str(exc)) else type(exc).__name__
-            self.append_done(
-                url=url, indexability_status=error_msg)
+            self._on_connection_error(url, exc)
         else:
             # only url with status == 200 and content type == 'text/html' parsed
             if (resp.status == 200 and
@@ -425,38 +440,48 @@ class Crawler:
                                  indexability=is_index,
                                  indexability_status=indexability_status,
                                  hash_val=md5(data.encode()).hexdigest(),
-                                 response_time=stop-start,
                                  dom=parser)
             elif 300 <= resp.status < 400:
                 redirect_url = resp.headers.get('location')
                 self.append_done(response=resp, url=url,
                                  indexability=False,
-                                 indexability_status=resp.reason,
-                                 response_time=stop-start)
+                                 indexability_status=resp.reason)
                 if redirect_url:
                     self.add_url(redirect_url, url)
             elif resp.status > 400:
                 self.append_done(response=resp,
                                  url=url,
                                  indexability=False,
-                                 indexability_status=resp.reason,
-                                 response_time=stop-start)
+                                 indexability_status=resp.reason)
             else:
                 self.append_done(resp,
                                  url,
-                                 indexability=True,
-                                 response_time=stop-start)
+                                 indexability=True)
 
             # even if we have no exception, we can mark url as good
             resp.close()
-        try:
-            self.busy[url] -= 1
-            if self.busy[url] == 0:
-                del self.busy[url]
-        except Exception as exc:
-            print(type(exc).__name__)
+        self.busy[url] -= 1
+        if self.busy[url] == 0:
+            del self.busy[url]
         logging.info(len(self.done), 'completed tasks,', len(self.tasks),
                      'still pending, todo_queue', len(self.todo_queue))
+
+    def _on_connection_error(self, url, exc):
+        print(exc)
+        # on any exception mark url as BAD
+        print('...', url, 'has error', repr(str(exc)))
+        error_msg = repr(str(exc)) if repr(
+            str(exc)) else type(exc).__name__
+        self.append_done(
+            url=url, indexability_status=error_msg)
+
+    def _on_timeout_error(self, url, exc):
+        if url not in self.errors:
+            self.errors.add(url)
+            self.add_url(url)
+        else:
+            self.append_done(
+                url=url, indexability_status=type(exc).__name__)
 
     def add_url(self, url, parent_url=''):
         """
@@ -471,7 +496,6 @@ class Crawler:
                     indexability: bool = False,
                     indexability_status: str = None,
                     hash_val: str = None,
-                    response_time: float = None,
                     dom=None):
         """
         Appends information about the given URL to the 'done' list of this object.
@@ -514,15 +538,12 @@ c = Crawler('https://www.thailandpostmart.com/',
             )
 c.set_exclude_url(['/app/tag/name', '/search/allproducts/',
                   ".pdf", ".jpg", ".zip", 'mod_resize.index', '.png'])
-try:
-    with open('robots.txt.json', 'r', encoding="utf-8") as f:
-        c.robots_txt = json.load(f)
-except FileNotFoundError:
-    pass
 c.runsync()
-with open('robots.txt.json', 'w', encoding="utf-8") as f:
-    json.dump(c.robots_txt, f)
+c.done_df.to_csv('export.csv', index=False)
+c.links_df.to_csv('links.csv', index=False)
+
 mem = tracemalloc.get_traced_memory()
+
 # print as mb
 print(f"Memory usage: {mem[0] / 10**6} MB")
 print(f"Memory peak: {mem[1] / 10**6} MB")
