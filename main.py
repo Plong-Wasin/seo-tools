@@ -94,7 +94,7 @@ class Parser():
         Extracts meta tags from self.dochtml and returns a dictionary.
         """
         select = cssselect.CSSSelector(
-            'meta[name="robots"][content],title,meta[name="description"][content],meta[property^="og:"][content]')
+            'meta[name="robots"][content],title,meta[name="description"][content],meta[property^="og:"][content],meta[name^="twitter:"][content]')
         elements = select(self.dochtml)
         return_value = {}
         for element in elements:
@@ -226,6 +226,7 @@ class Crawler:
     done_df = pd.DataFrame()
     links_df = pd.DataFrame()
     robots_txt_busy = set()
+    url_encoded_decoded = dict()
 
     def __init__(
         self, url: str,
@@ -291,9 +292,21 @@ class Crawler:
             self.append_done(url=k, indexability=False,
                              indexability_status="Always busy")
         self.done_df = pd.DataFrame(self.done)
+        self.url_encoded_decoded = self.done_df.set_index('url_encoded')[
+            'url'].to_dict()
 
+        # links = []
+        # for v in self.links:
+        #     pass
+        # links.append([self.done_df[v[0]]),
+        #              UrlParser.decode_url(v[1])])
         self.links_df = pd.DataFrame(
             self.links, columns=['from', 'to']).drop_duplicates()
+        self.links_df[['from', 'to']] = self.links_df[['from', 'to']
+                                                      ].applymap(lambda x: self.url_encoded_decoded.get(x, self.decode_url(x)))
+        # self.links_df['from'] = self.links_df['from'].apply( lambda x:
+        #     )
+        # self.links_df['to'] = self.links_df['to'].apply(UrlParser.decode_url)
 
     async def check_allow_crawl(self, url):
         """
@@ -388,7 +401,7 @@ class Crawler:
 
     def _is_url_in_domain(self, url, parenturl):
         """Checks if a given url is in the same domain as the parenturl"""
-        return parenturl.startswith(self.rooturl) or url.startswith(self.rooturl)
+        return (parenturl.startswith(self.rooturl) and self.allow_external) or url.startswith(self.rooturl)
 
     def _has_excluded_part(self, url):
         """Checks if a given url contains any part that should be excluded"""
@@ -419,29 +432,33 @@ class Crawler:
             if (resp.status == 200 and
                     ('text/html' in resp.headers.get('content-type'))
                     and str(url).startswith(self.rooturl)):
-                data = (await resp.read()).decode('utf-8', 'replace')
-                parser = Parser(data)
-                urls = parser.parse()
+                try:
+                    data = (await resp.read()).decode('utf-8', 'replace')
+                except asyncio.exceptions.TimeoutError:
+                    print(url)
+                else:
+                    parser = Parser(data)
+                    urls = parser.parse()
 
-                if parser.is_follow():
-                    addurls = self.addurls([(u, url) for u in urls])
-                    asyncio.Task(addurls)
-                indexability_status = None
-                is_index = parser.is_index()
+                    if parser.is_follow():
+                        addurls = self.addurls([(u, url) for u in urls])
+                        asyncio.Task(addurls)
+                    indexability_status = None
+                    is_index = parser.is_index()
 
-                if not is_index:
-                    indexability_status = 'noindex'
-                canonical_url = parser.get_canonical_url()
-                if canonical_url:
-                    if canonical_url != url:
-                        indexability_status = 'Canonicalised'
-                        is_index = False
-                self.append_done(resp,
-                                 url,
-                                 indexability=is_index,
-                                 indexability_status=indexability_status,
-                                 hash_val=md5(data.encode()).hexdigest(),
-                                 dom=parser)
+                    if not is_index:
+                        indexability_status = 'noindex'
+                    canonical_url = parser.get_canonical_url()
+                    if canonical_url:
+                        if canonical_url != url:
+                            indexability_status = 'Canonicalised'
+                            is_index = False
+                    self.append_done(resp,
+                                     url,
+                                     indexability=is_index,
+                                     indexability_status=indexability_status,
+                                     hash_val=md5(data.encode()).hexdigest(),
+                                     dom=parser)
             elif 300 <= resp.status < 400:
                 redirect_url = resp.headers.get('location')
                 self.append_done(response=resp, url=url,
@@ -461,11 +478,12 @@ class Crawler:
 
             # even if we have no exception, we can mark url as good
             resp.close()
-        self.busy[url] -= 1
-        if self.busy[url] == 0:
-            del self.busy[url]
-        logging.info(len(self.done), 'completed tasks,', len(self.tasks),
-                     'still pending, todo_queue', len(self.todo_queue))
+        finally:
+            self.busy[url] -= 1
+            if self.busy[url] == 0:
+                del self.busy[url]
+            logging.info(len(self.done), 'completed tasks,', len(self.tasks),
+                         'still pending, todo_queue', len(self.todo_queue))
 
     def _on_connection_error(self, url, exc):
         print(exc)
@@ -510,6 +528,7 @@ class Crawler:
             "indexability_status": indexability_status,
             "content_type": response.headers.get('content-type') if response else None,
             "response_code": response.status if response else None,
+            "url_encoded": url,
             "hash": hash_val,
             "redirected_url": UrlParser.decode_url(response.headers.get('location')) if response and response.headers.get('location') else None,
             "canonical_url": UrlParser.decode_url(canonical_url) if canonical_url else None,
@@ -529,6 +548,28 @@ class Crawler:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.run())
 
+    def decode_url(self, url):
+        """
+        Decodes the given URL if it hasn't been decoded before and returns the result.
+        The decoded URL is cached in `self.url_encoded_decoded` to avoid recomputing it.
+        """
+        self.url_encoded_decoded[url] = self.url_encoded_decoded.get(
+            url, UrlParser.decode_url(url))
+        return self.url_encoded_decoded[url]
+
+    def export_sitemap(self, path):
+        """
+        Export a sitemap in XML format to the given path.
+        """
+        string = """<?xml version="1.0" encoding="utf-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"""
+        for value in self.done_df:
+            if value['url_encoded'].startswith(self.rooturl) and 'html' in value['content_type']:
+                string += f"<url><loc>{value['url_encoded']}</loc></url>"
+        string += "</urlset>"
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(string)
+
 
 profiler = cProfile.Profile()
 profiler.enable()
@@ -539,7 +580,7 @@ c = Crawler('https://www.thailandpostmart.com/',
             allow_external=True, busy_timeout=60
             )
 c.set_exclude_url(['/app/tag/name', '/search/allproducts/',
-                  ".pdf", ".jpg", ".zip", 'mod_resize.index', '.png'])
+                  ".pdf", ".jpg", ".zip", 'mod_resize.index', '.png', 'twitter', 'facebook'])
 c.runsync()
 c.done_df.to_csv('export.csv', index=False)
 c.links_df.to_csv('links.csv', index=False)
